@@ -64,6 +64,7 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.conflict_k = conflict_k
+        self.grad_dir_ema = torch.empty(0)
         self.grad_mag_short = torch.empty(0)
         self.grad_mag_long = torch.empty(0)
         self.grad_view_count = torch.empty(0)
@@ -191,6 +192,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.grad_dir_ema = torch.zeros((self.get_xyz.shape[0], 2), device="cuda")
         self.grad_mag_short = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.grad_mag_long = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.grad_view_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -395,6 +397,7 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
+        self.grad_dir_ema = self.grad_dir_ema[valid_points_mask]
         self.grad_mag_short = self.grad_mag_short[valid_points_mask]
         self.grad_mag_long = self.grad_mag_long[valid_points_mask]
         self.grad_view_count = self.grad_view_count[valid_points_mask]
@@ -444,6 +447,7 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
         new_n = new_xyz.shape[0]
+        self.grad_dir_ema = torch.cat((self.grad_dir_ema, torch.zeros((new_n, 2), device="cuda")))
         self.grad_mag_short = torch.cat((self.grad_mag_short, torch.zeros((new_n, 1), device="cuda")))
         self.grad_mag_long = torch.cat((self.grad_mag_long, torch.zeros((new_n, 1), device="cuda")))
         self.grad_view_count = torch.cat((self.grad_view_count, torch.zeros((new_n, 1), device="cuda")))
@@ -514,8 +518,11 @@ class GaussianModel:
     def add_conflict_stats(self, viewspace_point_tensor, update_filter):
         grad_2d = viewspace_point_tensor.grad[update_filter, :2]
         grad_mag = torch.norm(grad_2d, dim=-1, keepdim=True)
+        grad_norm = grad_mag.clamp(min=1e-8)
+        grad_unit = grad_2d / grad_norm
         alpha_short = 1.0 / self.conflict_k
         alpha_long = 1.0 / (self.conflict_k * 5)
+        self.grad_dir_ema[update_filter] = (1 - alpha_short) * self.grad_dir_ema[update_filter] + alpha_short * grad_unit
         self.grad_mag_short[update_filter] = (1 - alpha_short) * self.grad_mag_short[update_filter] + alpha_short * grad_mag
         self.grad_mag_long[update_filter] = (1 - alpha_long) * self.grad_mag_long[update_filter] + alpha_long * grad_mag
         self.grad_view_count[update_filter] += 1
@@ -529,7 +536,10 @@ class GaussianModel:
         if valid.sum() == 0:
             return
         ratio = self.grad_mag_short[valid] / (self.grad_mag_long[valid] + 1e-8)
-        self.conflict_score[valid] = torch.clamp(ratio - 1.0, 0.0, 2.0) / 2.0
+        ratio_signal = torch.clamp(ratio.squeeze(-1) - 1.0, 0.0, 1.0)
+        direction_consistency = torch.norm(self.grad_dir_ema[valid], dim=-1)
+        direction_conflict = 1.0 - direction_consistency
+        self.conflict_score[valid] = (ratio_signal * direction_conflict).unsqueeze(-1)
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
