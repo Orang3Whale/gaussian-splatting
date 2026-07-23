@@ -12,6 +12,7 @@
 import os
 import random
 import json
+import torch
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
@@ -92,6 +93,9 @@ class Scene:
 
         with open(os.path.join(self.model_path, "exposure.json"), "w") as f:
             json.dump(exposure_dict, f, indent=2)
+
+        torch.save(self.gaussians.conflict_score.detach().cpu(),
+                   os.path.join(point_cloud_path, "conflict_score.pt"))
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]
